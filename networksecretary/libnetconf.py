@@ -1,14 +1,11 @@
 import sys, os
+import re
 import asyncio
 from asyncio.subprocess import PIPE, DEVNULL
-from rulebook.abider import RuleAbide
+from rulebook.abider import RuleAbider
 
-# file:///usr/share/doc/python/html/library/itertools.html?highlight=itertools#itertools-recipes
-def grouper(iterable, n, fillvalue=None):
-    "Collect data into fixed-length chunks or blocks"
-    # grouper('ABCDEFG', 3, 'x') --> ABC DEF Gxx"
-    args = [iter(iterable)] * n
-    return zip_longest(*args, fillvalue=fillvalue)
+import logging
+logger = logging.getLogger(__name__)
 
 class IpRoute2Table:
     CMD = ['ip']
@@ -38,46 +35,67 @@ class IpRoute2Table:
         while True:
             line = yield from stream.readline()
             if not line: break
-            self._parse_line(line.strip())
+            self._parse_line(line.decode('utf-8').strip())
 
     @asyncio.coroutine
     def _load(self):
+        logger.debug('Loading %s from iproute2', self.subcmd)
         #self.loop.subprocess_exec(IpRoute2Protocol, self.CMD, '-o', self.name, stderr=sys.stderr)
-        cmd = self.cmd + ['-o', self.subcmd]
-        proc = yield from asyncio.create_subprocess_exec(*cmd, stdin=DEVNULL, stdout=PIPE)
+        cmd = self.CMD + ['-o', self.subcmd]
+        proc = yield from asyncio.create_subprocess_exec(*cmd, stdin=DEVNULL, stdout=PIPE,
+                start_new_session=True)
 
         yield from self._parse_output(proc.stdout)
 
+    @asyncio.coroutine
+    def _start_monitor(self):
+        #self.loop.subprocess_exec(IpRoute2Protocol, self.CMD, '-o', self.name, stderr=sys.stderr)
+        cmd = self.CMD + ['-o', 'monitor', self.subcmd]
+        self.monitor_proc = yield from asyncio.create_subprocess_exec(*cmd, stdin=DEVNULL,
+                stdout=PIPE, start_new_session=True)
+        self.monitor_task = asyncio.Task(self._parse_output(self.monitor_proc.stdout))
 
     @asyncio.coroutine
     def start(self):
-        self._start()
-        self._load()
+        yield from self._start_monitor()
+        yield from self._load()
+
+    def __del__(self):
+        self.monitor_proc.terminate()
 
 
 
 class Interface(RuleAbider):
     up = False
     carrier = False
-    def __init__(self, name):
+    def __init__(self, index, name, mac):
+        super().__init__()
+        self.index = index
         self.name = name
+        self.mac = mac
+
+    def __repr__(self):
+        return '<Interface %d:%s>'%(self.index, self.name)
 
 class InterfaceMonitor(IpRoute2Table):
-    IFACE_RE = r'^(Deleted\s+)?(\d+):\s*(\S+):\s*\<([^>])+\>.*link/ether\s+(\S+).*'
+    IFACE_RE = re.compile(r'^(Deleted\s+)?(\d+):\s*(\S+):\s*\<([^>]+)\>(?:.*link/ether\s+(\S+))?.*')
     def __init__(self, lst):
         super().__init__('link')
         self._lst = lst
 
     def _parse_line(self, line):
-        m = IFACE_RE.match(line)
+        m = self.IFACE_RE.match(line)
         if not m:
-            print("Invalid 'ip link' line:", line, file=sys.stderr)
+            logger.warning("Invalid 'ip link' line: %s", line)
+            return
 
         deleted = bool(m.group(1))
         index = int(m.group(2))
         name = m.group(3)
         flags = set(m.group(4).split(','))
         mac = m.group(5)
+
+        if name == 'lo': return
 
         if deleted:
             self._lst._delete(index)
@@ -87,23 +105,29 @@ class InterfaceMonitor(IpRoute2Table):
 
 class InterfaceList(RuleAbider):
     def __init__(self):
+        super().__init__()
         self._data = {}
         self._byname = {}
         self._bymac = {}
 
     def _reindex(self):
-        self._byname = { iface.name: iface for iface in self._data }
-        self._bymac = { iface.mac: iface for iface in self._data }
-        # Tell Rulebook that iteration contents have changed
-        self._changed('__iter__')
+        self._byname = { iface.name: iface for iface in self._data.values() }
+        self._bymac = { iface.mac: iface for iface in self._data.values() }
 
     def _delete(self, index):
         try: del self._data[index]
         except KeyError: pass
         else:
             self._reindex()
+            self.changed(('iter', None))
 
     def _update(self, index, name, flags, mac):
+        # The keys/attributes that changed contents (meaning they now refer to a different
+        # object; changes _inside_ objects don't count). Used to report to Rulebook.
+        changed = []
+
+        logger.debug('IFACE_UPD %d:%s <%s> %s', index, name, ','.join(flags), mac)
+
         # Attributes/items affected by the update. Used to notify Rulebook.
         carrier = 'NO-CARRIER' not in flags # I don't like double negatives.
         if index in self._data:
@@ -111,6 +135,8 @@ class InterfaceList(RuleAbider):
             if name != iface.name:
                 changed.append(iface.name)
                 changed.append(name)
+                changed.append(('attr', name))
+                changed.append(('attr', iface.name))
             if mac != iface.mac:
                 changed.append(iface.mac)
                 changed.append(mac)
@@ -118,42 +144,44 @@ class InterfaceList(RuleAbider):
             iface.mac = mac
             iface.carrier = carrier
         else:
-            iface = Interface(name, mac)
+            iface = Interface(index, name, mac)
             iface.carrier = carrier
             self._data[index] = iface
             self._reindex()
-            changed = ['name', 'mac', 'index']
+            changed = [('attr', name), name, mac, index, ('iter', None)]
 
         for key in changed:
-            self._changed(('item', key))
-            if isinstace(key, str):
-                self._changed(('attr', key))
+            if isinstance(key, tuple):
+                self._changed(key)
+            else:
+                self._changed(('item', key))
 
-
+    def __iter__(self):
+        return iter(self._data.values())
 
     def __getitem__(self, key):
         try: return self._byname[key]
         except KeyError: pass
         try: return self._bymac[key]
         except KeyError: pass
-        try: return self._key[key]
+        try: return self._data[key]
         except KeyError: pass
         raise KeyError(key)
 
     def __getattr__(self, name):
         try: return self[name]
-        except KeyError: return AttributeError(name)
+        except KeyError: raise AttributeError(name)
 
 
 
 class NetworkState(RuleAbider):
     def __init__(self):
+        super().__init__()
         self.ifaces = InterfaceList()
         self._ifmon = InterfaceMonitor(self.ifaces)
 
     @asyncio.coroutine
     def start(self):
-        pass
-    def start(self
+        yield from self._ifmon.start()
 
 
