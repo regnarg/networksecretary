@@ -2,6 +2,7 @@ import sys, os
 import re
 import asyncio
 from asyncio.subprocess import PIPE, DEVNULL
+import subprocess
 from rulebook.abider import RuleAbider
 
 import logging
@@ -74,6 +75,44 @@ class Interface(RuleAbider):
         self.name = name
         self.mac = mac
 
+        self.addrs = []
+        self.routes = []
+        self.up = False
+
+    def _ip(self, *a):
+        subprocess.check_call(('ip',)+a, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+
+    def _update(self):
+        if self.up:
+            self._ip('link', 'set', self.name, 'up')
+            # TODO On every update, we flush all addresses and re-add the current list.
+            #      This is ugly. We need some kind of "synchronization": add new addresses,
+            #      remove no-longer-wanted ones and leave the rest alone. This will require
+            #      more sophisticated iproute2 parsing.
+            self._ip('addr', 'flush', 'dev', self.name) # flushes routes too
+            for addr in self.addrs:
+                self._ip('addr', 'add', 'dev', self.name, *addr.strip().split())
+            for route in self.routes:
+                self._ip('route', 'add', 'dev', self.name, *route.strip().split())
+        else:
+            self._ip('link', 'set', self.name, 'down')
+
+    def set_addrs(self, addrs):
+        self.addrs = addrs
+        self._update()
+
+    def set_routes(self, routes):
+        self.routes = routes
+        self._update()
+
+    def set_up(self, up):
+        self.up = up
+        self._update()
+
+    def set_mac(self, up):
+        self.up = up
+        self._update()
+
     def __repr__(self):
         return '<Interface %d:%s>'%(self.index, self.name)
 
@@ -126,10 +165,11 @@ class InterfaceList(RuleAbider):
         # object; changes _inside_ objects don't count). Used to report to Rulebook.
         changed = []
 
-        logger.debug('IFACE_UPD %d:%s <%s> %s', index, name, ','.join(flags), mac)
+        logger.debug('IFACE_UPD %d:%s %r %s', index, name, flags, mac)
 
         # Attributes/items affected by the update. Used to notify Rulebook.
-        carrier = 'NO-CARRIER' not in flags # I don't like double negatives.
+        carrier = 'UP' in flags and 'NO-CARRIER' not in flags
+        logger.debug('.. carrier %d', carrier)
         if index in self._data:
             iface = self._data[index]
             if name != iface.name:
