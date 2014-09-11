@@ -4,6 +4,8 @@ import asyncio
 from asyncio.subprocess import PIPE, DEVNULL
 import subprocess
 from rulebook.abider import RuleAbider
+from pathlib import Path
+from .util import *
 
 import logging
 logger = logging.getLogger(__name__)
@@ -69,6 +71,8 @@ class IpRoute2Table:
 class Interface(RuleAbider):
     up = False
     carrier = False
+    wireless = False
+    netid = None
     def __init__(self, index, name, mac):
         super().__init__()
         self.index = index
@@ -78,6 +82,7 @@ class Interface(RuleAbider):
         self.addrs = []
         self.routes = []
         self.up = False
+
 
     def _ip(self, *a):
         subprocess.check_call(('ip',)+a, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
@@ -116,6 +121,62 @@ class Interface(RuleAbider):
     def __repr__(self):
         return '<Interface %d:%s>'%(self.index, self.name)
 
+class WiredInterface(Interface):
+    pass
+
+class Ess(RuleAbider):
+    def __init__(self, essid):
+        self.essid = essid
+
+class WirelessInterface(Interface):
+    wireless = True
+    scan = False
+    BSS_RE = re.compile(r'^BSS ([0-9a-f]{2}(?::[0-9a-f]{2}){5}).*', re.I)
+    SSID_RE = re.compile(r'^\s*SSID:\s*(.*)$', re.I)
+    @asyncio.coroutine
+    def do_scan(self):
+        # XXX The `iw` help explicitly asks us NOT to screen scrape its output.
+        # Too bad there is no other simple way.
+        proc = yield from asyncio.create_subprocess_exec('iw', 'dev', self.name, 'scan',
+                stdin=DEVNULL, stdout=PIPE)
+        out = (yield from proc.communicate())[0].decode('utf-8')
+        if proc.returncode != 0:
+            # XXX from time to time, the scan fails with
+            #     command failed: Device or resource busy (-16)
+            # Not sure why. We log it, ignore it and try again the next time.
+            # TODO investigate this
+            logger.error('Scan failed on %s.', self.name)
+            return
+        def end_item():
+            if bssid is None: return
+        bssid = None
+        for line in out.strip().split('\n'):
+            m = BSS_RE.match(line)
+            if m:
+                bssid = m.group(1)
+                end_item()
+                continue
+            m = SSID_RE.match(line)
+            if m:
+                ssid
+            bssid = line
+        end_item()
+
+    @asyncio.coroutine
+    def scan_coro(self):
+        while True:
+            yield from self.do_scan()
+            yield from asyncio.sleep(self.scan_interval)
+
+    def set_scan(self, scan):
+        if scan == self.scan: return
+        if scan:
+            import asyncio
+            self._scan_task = run_task(self.scan_coro())
+        else:
+            self._scan_task.cancel()
+
+
 class InterfaceMonitor(IpRoute2Table):
     IFACE_RE = re.compile(r'^(Deleted\s+)?(\d+):\s*(\S+):\s*\<([^>]+)\>(?:.*link/ether\s+(\S+))?.*')
     def __init__(self, lst):
@@ -135,6 +196,18 @@ class InterfaceMonitor(IpRoute2Table):
         mac = m.group(5)
 
         if name == 'lo': return
+        if not mac:
+            # My wireless interface (at least) emits superfluous events in ``ip monitor link``
+            # every few seconds. They can be distinguished by lacking a hardware address:
+            # 4: wlan0: <NO-CARRIER,BROADCAST,MULTICAST,UP>
+            #     link/ether
+            # 4: wlan0: <NO-CARRIER,BROADCAST,MULTICAST,UP>
+            #     link/ether
+            # 4: wlan0: <NO-CARRIER,BROADCAST,MULTICAST,UP>
+            #     link/ether
+            # ...
+            # TODO: figure out why
+            return
 
         if deleted:
             self._lst._delete(index)
@@ -184,7 +257,11 @@ class InterfaceList(RuleAbider):
             iface.mac = mac
             iface.carrier = carrier
         else:
-            iface = Interface(index, name, mac)
+            wireless = (Path('/sys/class/net') / name / 'wireless').exists()
+            if wireless:
+                iface = WirelessInterface(index, name, mac)
+            else:
+                iface = WiredInterface(index, name, mac)
             iface.carrier = carrier
             self._data[index] = iface
             self._reindex()
@@ -223,5 +300,33 @@ class NetworkState(RuleAbider):
     @asyncio.coroutine
     def start(self):
         yield from self._ifmon.start()
+
+class DhcpClient(RuleAbider):
+    def __init__(self, iface):
+        self.iface = weakref.ref(iface, self._iface_removed)
+        self.active = False
+
+    def _iface_removed(self):
+        self.set_active(False)
+        self.iface = None
+
+    def start(self):
+        if self.active: return
+        iface = self.iface()
+        if iface is None: return
+        cmd = ['udhcpc', '-i', iface.name, '-f']
+        if self.client_id:
+            cmd += ['-c', self.client_id]
+        self.proc = asyncio.create_subprocess_exec(*cmd, stdout=PIPE)
+        self.active = True
+
+    def stop(self):
+        if not self.active: return
+        self.proc.kill()
+        self.active = False
+
+    def set_active(self, active):
+        if active: self.stop()
+        else: self.start()
 
 
