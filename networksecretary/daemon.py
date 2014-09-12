@@ -23,6 +23,9 @@ else:
     HAVE_IPYTHON = True
 
 if HAVE_IPYTHON:
+    # XXX IPython infests this application with threads!! I'm not sure why.
+    #     I'm not even sure in which one the interactive commands are executed.
+    # TODO Try to get rid of that.
     class IPythonEmbed:
         def __init__(self, ns):
             self.ns = ns
@@ -114,13 +117,13 @@ class Daemon:
         # Make all exceptions fatal for easier debugging
         self.loop.set_exception_handler(self._exception_handler)
         tasks = []
+        logger.info("Loading network state")
+        self.ns = NetworkState()
         if HAVE_IPYTHON:
+            self.ipython.ns['ns'] = self.ns
             self.ipython.start()
             logger.info("IPython ready. Connect with: ``nsctl console`` or ``ipython console --existing %s``",
                     self.ipython.app.connection_file)
-        logger.info("Loading network state")
-        self.ns = NetworkState()
-        self.ipython.ns['ns'] = self.ns
         self.ctx = rulebook.runtime.Context()
         self.ctx.ns.ns = self.ns # Make the NetworkState available under the name 'ns'
                                  # in the namespace of the rulebooks (a bit unfortunate

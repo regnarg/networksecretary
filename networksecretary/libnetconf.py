@@ -3,8 +3,12 @@ import re
 import asyncio
 from asyncio.subprocess import PIPE, DEVNULL
 import subprocess
-from rulebook.abider import RuleAbider
 from pathlib import Path
+import weakref
+from ipaddress import IPv4Address, IPv4Network
+
+from rulebook.abider import RuleAbider
+
 from .util import *
 
 import logging
@@ -83,6 +87,8 @@ class Interface(RuleAbider):
         self.routes = []
         self.up = False
 
+        self.dhcp_client_obj = DHCPClient(self)
+
 
     def _ip(self, *a):
         subprocess.check_call(('ip',)+a, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
@@ -96,7 +102,11 @@ class Interface(RuleAbider):
             #      more sophisticated iproute2 parsing.
             self._ip('addr', 'flush', 'dev', self.name) # flushes routes too
             for addr in self.addrs:
-                self._ip('addr', 'add', 'dev', self.name, *addr.strip().split())
+                addr_flds = addr.strip().split()
+                if 'brd' not in addr_flds:
+                    # Auto-set broadcast address if not explicitly given
+                    addr_flds += ['brd', '+']
+                self._ip('addr', 'add', 'dev', self.name, *addr_flds)
             for route in self.routes:
                 self._ip('route', 'add', 'dev', self.name, *route.strip().split())
         else:
@@ -147,20 +157,6 @@ class WirelessInterface(Interface):
             # TODO investigate this
             logger.error('Scan failed on %s.', self.name)
             return
-        def end_item():
-            if bssid is None: return
-        bssid = None
-        for line in out.strip().split('\n'):
-            m = BSS_RE.match(line)
-            if m:
-                bssid = m.group(1)
-                end_item()
-                continue
-            m = SSID_RE.match(line)
-            if m:
-                ssid
-            bssid = line
-        end_item()
 
     @asyncio.coroutine
     def scan_coro(self):
@@ -301,32 +297,91 @@ class NetworkState(RuleAbider):
     def start(self):
         yield from self._ifmon.start()
 
-class DhcpClient(RuleAbider):
+class DHCPLease(RuleAbider):
+    pass
+
+class DHCPClient(RuleAbider):
     def __init__(self, iface):
+        super().__init__()
         self.iface = weakref.ref(iface, self._iface_removed)
         self.active = False
+        self.client_id = None
+        self.lease = None
 
     def _iface_removed(self):
         self.set_active(False)
         self.iface = None
 
+    def _update_lease(self, lease, data):
+        # Convert ip+netmask to the more convenient "1.2.3.4/24" format that can be
+        # directly added to ``iface.addrs``.
+        prefixlen = IPv4Network('0.0.0.0/%s'%(data['subnet'])).prefixlen
+        data['addr'] = '%s/%d' % (data['ip'], prefixlen)
+        for k, v in data.items():
+            # XXX this shouldn't be necessary but currently is. In the future,
+            # Rulebook will ignore assignments that don't change the value.
+            # Currently it doesn't so we need this condition so as not to re-set
+            # the interface addresses upon every renewal.
+            if getattr(lease, k, None) != v:
+                setattr(lease, k, v)
+
+    def _process_event(self, data):
+        logger.debug('DHCP_EV %r', data)
+        event = data.pop('event')
+        if event == 'deconfig':
+            self.lease = None
+        elif event == 'bound':
+            lease = DHCPLease()
+            self._update_lease(lease, data)
+            self.lease = lease
+        elif event == 'renew':
+            self._update_lease(self.lease, data)
+
+    @asyncio.coroutine
+    def _output_processor(self):
+        data = {}
+        while True:
+            line = yield from self.proc.stdout.readline()
+            if not line: break
+            line = line.decode('utf-8').strip()
+            # Events are blocks of name=value variable assignments, followed by a blank line.
+            # See `udhcpc-script.sh`.
+            if '=' in line:
+                name, val = line.split('=', 1)
+                data[name] = val
+            elif not line:
+                self._process_event(data)
+                data = {}
+            else:
+                logger.error('Unknown line from DHCP script ignored: %r', line)
+
+
+    @asyncio.coroutine
     def start(self):
         if self.active: return
         iface = self.iface()
         if iface is None: return
-        cmd = ['udhcpc', '-i', iface.name, '-f']
+        cmd = [str(LIBDIR / 'udhcpc-wrapper.sh'), '-i', iface.name, '-f']
         if self.client_id:
             cmd += ['-c', self.client_id]
-        self.proc = asyncio.create_subprocess_exec(*cmd, stdout=PIPE)
+        self.proc = yield from asyncio.create_subprocess_exec(*cmd, stdout=PIPE)
+        self.task = run_task(self._output_processor())
         self.active = True
 
+    @asyncio.coroutine
     def stop(self):
         if not self.active: return
+        # Yes, kill. `udhcpc` should not have any persistent state and we don't want to
+        # send DHCPRELEASE.
         self.proc.kill()
+        self.task.cancel()
         self.active = False
 
     def set_active(self, active):
-        if active: self.stop()
-        else: self.start()
+        if active: run_task(self.start())
+        else: run_task(self.stop())
+
+    def __del__(self):
+        if self.active: self.proc.kill()
 
 

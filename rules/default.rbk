@@ -1,0 +1,81 @@
+set prio -1000
+ignore_ifaces = ['ppp0', 'wlan0']
+
+enter:
+    # These functions are declared here (rather than in a *.py file) so that they
+    # have implicit access to the Context. This may change.
+    import asyncio
+    from asyncio.subprocess import PIPE, DEVNULL
+    global netdet_coro, netdet_cancel, netdet_exec
+    def netdet_coro(iface, coro, prio, val_id):
+        @asyncio.coroutine
+        def inner():
+            netid = yield from coro(iface)
+            if netid:
+                C.add_value((iface, 'attr', 'netid'), netid, prio, val_id)
+        from networksecretary.util import run_task
+        task = run_task(inner())
+        iface.dr_netdet_tasks = getattr(iface, 'dr_netdet_tasks', []) + [task]
+    def netdet_cancel(iface):
+        for task in getattr(iface, 'dr_netdet_tasks', []):
+            task.cancel()
+        iface.dr_netdet_tasks = []
+        C.remove_value((iface, 'attr', 'netid'), 'netdet_dhcp')
+    def netdet_exec(iface, argv, prio, val_id):
+        @asyncio.coroutine
+        def cmd_coro(iface):
+            N.logger.info("NETDET: starting %r", argv)
+            proc = yield from asyncio.create_subprocess_exec(*argv, stdin=DEVNULL, stdout=PIPE)
+            out = (yield from proc.communicate())[0].decode('ascii').strip()
+            if proc.returncode == 0 and out:
+                N.logger.info("NETDET: detected '%s'", out)
+                return out
+            else:
+                N.logger.info("NETDET: failed")
+                return None
+        return netdet_coro(iface, cmd_coro, prio, val_id)
+
+for iface in ns.ifaces:
+    if iface.name not in ignore_ifaces:
+        iface.addrs = [] prio -2000
+        iface.routes = [] prio -2000
+        iface.up = False prio -2000
+        iface.role = 'inet_client' prio -2000
+        iface.netdet_method = 'dhcp' prio -2000
+        iface.netid = None prio -2000
+        iface.dhcp_client = False prio -2000 # get address from DHCP
+        # `ready` is set when the interface is capable of ehternet traffic
+        # For wired interfaces this means up&&has carrier, for wireless
+        # ifaces a successful association.
+        iface.ready = False prio -2000
+        if iface.wireless:
+            iface.up = True # TODO
+            iface.scan = False prio -2000
+            iface.scan_interval = 60
+            if iface.up:
+                iface.scan = True
+        else:
+            iface.up = True
+            if iface.carrier:
+                iface.ready = True
+                if iface.netdet_method == 'dhcp' and not iface.netid:
+                    c_enter:
+                        N.logger.debug("### NETDET starting")
+                        from networksecretary.util import LIBDIR
+                        netdet_exec(N.iface, [str(LIBDIR / 'netdet-dhcp.sh'), N.iface.name],
+                                -1000, 'netdet_dhcp')
+                leave:
+                    netdet_cancel(N.iface)
+        if iface.ready and iface.netid:
+            iface.dhcp_client = True
+        if iface.ready and iface.dhcp_client:
+            ## XXX Creating new objects from Rulebook is currently error-prone.
+            ## For now, pre-create the object in the Interface constructor.
+            #from networksecretary.libnetconf import DhcpClient
+            #iface.dhcp_client_obj = DhcpClient(iface)
+            iface.dhcp_client_obj.active = True
+            if iface.dhcp_client_obj.lease:
+                iface.addrs = [iface.dhcp_client_obj.lease.addr]
+
+
+
