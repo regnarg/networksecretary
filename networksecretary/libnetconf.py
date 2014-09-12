@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 import weakref
 from ipaddress import IPv4Address, IPv4Network
+import json
 
 from rulebook.abider import RuleAbider
 
@@ -72,11 +73,48 @@ class IpRoute2Table:
 
 
 
+class PersistentStorage(RuleAbider):
+    def __init__(self, key):
+        super().__init__()
+        self._key = key
+        self._load()
+
+    @property
+    def _filename(self):
+        return DATA_DIR / (self._key + '.json')
+
+    def _save(self):
+        data = { k: v for k, v in vars(self).items() if not k.startswith('_') }
+        with open(str(self._filename) + '.tmp', 'w') as file:
+            json.dump(data, file)
+            file.write('\n') # everybody hates files without final newlines (especially cats ;-))
+        os.rename(str(self._filename) + '.tmp', str(self._filename))
+
+    def _load(self):
+        if self._filename.exists():
+            with self._filename.open('r') as file:
+                data = json.load(file)
+                for k,v in data.items(): setattr(self, k, v)
+
+    def __setattr__(self, name, val):
+        super().__setattr__(name, val)
+        if not name.startswith('_'):
+            self._save()
+
+    def __getattr__(self, name):
+        if name.startswith('_'):
+            raise AttributeError(name)
+        return None
+
 class Interface(RuleAbider):
     up = False
     carrier = False
     wireless = False
     netid = None
+    netdata = None
+    gateway = None
+    addrs = ()
+    preference = 0
     def __init__(self, index, name, mac):
         super().__init__()
         self.index = index
@@ -89,11 +127,18 @@ class Interface(RuleAbider):
 
         self.dhcp_client_obj = DHCPClient(self)
 
+    def set_netid(self, netid):
+        if netid:
+            self.netdata = PersistentStorage('net.' + netid)
+        else:
+            self.netdata = None
+        self.netid = netid
 
     def _ip(self, *a):
         subprocess.check_call(('ip',)+a, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
 
-    def _update(self):
+    def commit(self):
+        logger.info('IFACE_IPD %s addrs=%r routes=%r', self.name, self.addrs, self.routes)
         if self.up:
             self._ip('link', 'set', self.name, 'up')
             # TODO On every update, we flush all addresses and re-add the current list.
@@ -111,22 +156,8 @@ class Interface(RuleAbider):
                 self._ip('route', 'add', 'dev', self.name, *route.strip().split())
         else:
             self._ip('link', 'set', self.name, 'down')
+    _rbk_commit = commit
 
-    def set_addrs(self, addrs):
-        self.addrs = addrs
-        self._update()
-
-    def set_routes(self, routes):
-        self.routes = routes
-        self._update()
-
-    def set_up(self, up):
-        self.up = up
-        self._update()
-
-    def set_mac(self, up):
-        self.up = up
-        self._update()
 
     def __repr__(self):
         return '<Interface %d:%s>'%(self.index, self.name)
@@ -305,6 +336,7 @@ class DHCPClient(RuleAbider):
         super().__init__()
         self.iface = weakref.ref(iface, self._iface_removed)
         self.active = False
+        self.running = False
         self.client_id = None
         self.lease = None
 
@@ -358,28 +390,32 @@ class DHCPClient(RuleAbider):
 
     @asyncio.coroutine
     def start(self):
-        if self.active: return
+        if self.running: return
+        self.running = True
         iface = self.iface()
         if iface is None: return
         cmd = [str(LIBDIR / 'udhcpc-wrapper.sh'), '-i', iface.name, '-f']
         if self.client_id:
             cmd += ['-c', self.client_id]
+        if self.request_ip:
+            cmd += ['-r', self.request_ip]
         self.proc = yield from asyncio.create_subprocess_exec(*cmd, stdout=PIPE)
         self.task = run_task(self._output_processor())
-        self.active = True
 
     @asyncio.coroutine
     def stop(self):
-        if not self.active: return
+        if not self.running: return
         # Yes, kill. `udhcpc` should not have any persistent state and we don't want to
         # send DHCPRELEASE.
+        if self.start_task: yield from self.start_task
         self.proc.kill()
         self.task.cancel()
-        self.active = False
+        self.running = False
 
-    def set_active(self, active):
-        if active: run_task(self.start())
+    def commit(self):
+        if self.active: self.start_task = run_task(self.start())
         else: run_task(self.stop())
+    _rbk_commit = commit
 
     def __del__(self):
         if self.active: self.proc.kill()

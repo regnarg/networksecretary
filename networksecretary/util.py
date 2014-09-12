@@ -18,7 +18,7 @@ def umask_ctx(val):
         os.umask(old)
 
 def _get_paths():
-    global RULES_LIB, RULES_BUILTIN, RULES_USER, RUNDIR, LIBDIR
+    global RULES_LIB, RULES_BUILTIN, RULES_USER, RUNDIR, LIBDIR, DATA_DIR
     prefix = Path(sys.prefix)
     my_path = Path(__file__).resolve()
     if prefix in my_path.parents:
@@ -30,11 +30,13 @@ def _get_paths():
     RULES_BUILTIN = LIBDIR / 'rules'
     RULES_USER = Path('/etc/networksecretary/rules')
     RUNDIR = Path('/run/networksecretary')
-    if RUNDIR.exists():
-        os.chown(str(RUNDIR), 0, 0)
-        RUNDIR.chmod(0o700)
-    else:
-        RUNDIR.mkdir(0o700)
+    DATA_DIR = Path('/var/lib/networksecretary')
+    for dir in [RUNDIR, DATA_DIR]:
+        if dir.exists():
+            os.chown(str(dir), 0, 0)
+            dir.chmod(0o700)
+        else:
+            dir.mkdir(0o700)
 
 def run_task(coro):
     """Run a coroutine and exit upon any exception.

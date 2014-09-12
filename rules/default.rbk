@@ -1,5 +1,6 @@
 set prio -1000
 ignore_ifaces = ['ppp0', 'wlan0']
+ns.gateway_iface = None prio -2000
 
 enter:
     # These functions are declared here (rather than in a *.py file) so that they
@@ -44,17 +45,22 @@ for iface in ns.ifaces:
         iface.netdet_method = 'dhcp' prio -2000
         iface.netid = None prio -2000
         iface.dhcp_client = False prio -2000 # get address from DHCP
+        iface.gateway_prio = 0 prio -2000
+        iface.gateway = None prio -2000
+        iface.dhcp_client_obj.active = False prio -2000
         # `ready` is set when the interface is capable of ehternet traffic
         # For wired interfaces this means up&&has carrier, for wireless
-        # ifaces a successful association.
+        # ones, a successful association.
         iface.ready = False prio -2000
         if iface.wireless:
             iface.up = True # TODO
             iface.scan = False prio -2000
             iface.scan_interval = 60
+            iface.preference = -1000
             if iface.up:
                 iface.scan = True
         else:
+            iface.preference = 0
             iface.up = True
             if iface.carrier:
                 iface.ready = True
@@ -73,9 +79,38 @@ for iface in ns.ifaces:
             ## For now, pre-create the object in the Interface constructor.
             #from networksecretary.libnetconf import DhcpClient
             #iface.dhcp_client_obj = DhcpClient(iface)
+            # c_enter: # XXX should this be written declaratively?
+            #          # We would need to make sure that the attributes are set before activating the
+            #          # client. Commit-aware object will probably solve all this. TBD.
+            #     if N.iface.netdata and getattr(N.iface.netdata, 'last_ip', None):
+            #         N.iface.dhcp_client_obj.request_ip = N.iface.netdata.last_ip
+            #         N.iface.dhcp_client_obj.client_id = N.iface.netdata.last_client_id
+            #     else:
+            #         N.iface.dhcp_client_obj.request_ip = None
+            #         N.iface.dhcp_client_obj.client_id = None
+            #     N.iface.dhcp_client_obj.set_active(True)
+            # c_leave:
+            #     N.iface.dhcp_client_obj.set_active(False)
+            iface.dhcp_client_obj.request_ip = None prio -2000
+            iface.dhcp_client_obj.client_id = iface.mac prio -2000
+            if iface.netdata and iface.netdata.last_ip:
+                iface.dhcp_client_obj.request_ip = iface.netdata.last_ip
+            if iface.netdata and iface.netdata.last_client_id:
+                iface.dhcp_client_obj.client_id = iface.netdata.last_client_id
             iface.dhcp_client_obj.active = True
             if iface.dhcp_client_obj.lease:
                 iface.addrs = [iface.dhcp_client_obj.lease.addr]
+                if iface.netid:
+                    c_enter:
+                        N.iface.netdata.last_ip = N.iface.dhcp_client_obj.lease.ip
+                        N.iface.netdata.last_client_id = N.iface.dhcp_client_obj.client_id
+                if iface.role == 'inet_client' and iface.dhcp_client_obj.lease.router:
+                    iface.gateway = iface.dhcp_client_obj.lease.router
+        if iface.ready and iface.gateway:
+            ns.gateway_iface = iface prio iface.gateway_prio
+            if ns.gateway_iface == iface:
+                ns.gateway = iface.gateway
+                iface.routes = ['default via %s'%iface.gateway] # XXX +=
 
 
 
