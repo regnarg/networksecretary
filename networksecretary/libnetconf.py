@@ -91,23 +91,19 @@ class PersistentStorage(RuleAbider):
     def _filename(self):
         return self._get_filename(self._key)
 
-    def _save(self):
+    def save(self):
         data = { k: v for k, v in vars(self).items() if not k.startswith('_') }
         with open(str(self._filename) + '.tmp', 'w') as file:
             json.dump(data, file)
             file.write('\n') # everybody hates files without final newlines (especially cats ;-))
         os.rename(str(self._filename) + '.tmp', str(self._filename))
+    _rbk_commit = save
 
     def _load(self):
         if self._filename.exists():
             with self._filename.open('r') as file:
                 data = json.load(file)
                 for k,v in data.items(): setattr(self, k, v)
-
-    def __setattr__(self, name, val):
-        super().__setattr__(name, val)
-        if not name.startswith('_'):
-            self._save()
 
     def __getattr__(self, name):
         if name.startswith('_'):
@@ -180,6 +176,20 @@ class Ess(RuleAbider):
         self.bssid_list = []
         self.data = PersistentStorage('ess.' + essid)
         self.bssids = set()
+
+    # Doesn't play nice with Rulebook. The original idea was that the attribute (e.g.
+    # ess.preference) could be set either with a Rulebook rule or saved to `.data`
+    # and automagically read from there. However, that doesn't work. In fact, read/write
+    # properties don't work at all in Rulebook. Once the property is set by Rulebook,
+    # the attribute is assigned and remains so even when there is no longer any active
+    # Rulebook assignment. This would only work if Rulebook deleted the attribute
+    # when value set is empty. But that probably would be the wrong thing in many
+    # circumstances.
+    ## def __getattr__(self, name):
+    ##     if  not name.startswith('_'):
+    ##         v = getattr(self.data, name)
+    ##         if v: return v
+    ##     raise AttributeError(name)
 
 class EssList(RuleAbider):
     """A smart container for Ess objects. Supported operations:
@@ -402,6 +412,7 @@ class WirelessInterface(Interface):
             self._scan_task = run_task(self.scan_coro())
         else:
             self._scan_task.cancel()
+        self.scan = scan
 
     def commit(self):
         if self.connect_to:
