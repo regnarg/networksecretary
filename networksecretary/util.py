@@ -50,4 +50,11 @@ def run_task(coro):
     task.add_done_callback(cb)
     return task
 
+@contextmanager
+def rewrite_file(fn):
+    fn = str(fn)
+    with open(fn + '.tmp', 'w') as file:
+        yield file
+    os.rename(fn + '.tmp', fn)
+
 _get_paths()

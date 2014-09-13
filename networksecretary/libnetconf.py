@@ -79,9 +79,17 @@ class PersistentStorage(RuleAbider):
         self._key = key
         self._load()
 
+    @classmethod
+    def _get_filename(cls, key):
+        return DATA_DIR / (key + '.json')
+
+    @classmethod
+    def exists(cls, key):
+        return cls._get_filename(key).exists()
+
     @property
     def _filename(self):
-        return DATA_DIR / (self._key + '.json')
+        return self._get_filename(self._key)
 
     def _save(self):
         data = { k: v for k, v in vars(self).items() if not k.startswith('_') }
@@ -167,18 +175,208 @@ class WiredInterface(Interface):
 
 class Ess(RuleAbider):
     def __init__(self, essid):
+        super().__init__()
         self.essid = essid
+        self.bssid_list = []
+        self.data = PersistentStorage('ess.' + essid)
+        self.bssids = set()
+
+class EssList(RuleAbider):
+    """A smart container for Ess objects. Supported operations:
+      * for ess in ess_list: ...
+      * essid in ess_list
+      * ess_list.<essid>
+      * ess_list[essid]
+    """
+    def __init__(self):
+        super().__init__()
+        self._data = {}
+
+    def _process_scan_results(self, data):
+        ess_map = {}
+        for bss in data:
+            bssid = bss.pop('bssid')
+            essid = bss.pop('essid')
+            ess_itm = ess_map.setdefault(essid, {})
+            ess_itm.update(bss)
+            ess_itm.setdefault('bssids', set()).add(bssid)
+        to_remove = set(self._data.keys()) - set(ess_map.keys())
+        changed = []
+        for essid, ess_data in ess_map.items():
+            if essid in self._data:
+                ess = self._data[essid]
+            else: ess = Ess(essid)
+            for k,v in ess_data.items():
+                if v != getattr(ess, k, None):
+                    setattr(ess, k, v)
+                    chg = True
+            if essid not in self._data:
+                self._data[essid] = ess
+                changed.append(essid)
+        for essid in to_remove:
+            del self._data[essid]
+            changed.append(essid)
+        for essid in changed:
+            self._changed(('attr', essid))
+            self._changed(('item', essid))
+        if changed:
+            self._changed(('iter', None))
+
+    def __iter__(self):
+        return iter(self._data.values())
+
+    def __contains__(self, key):
+        return key in self._data
+
+    def __getitem__(self, key):
+        try: return self._data[key]
+        except KeyError: pass
+        raise KeyError(key)
+
+    def __getattr__(self, name):
+        if name.startswith('_'): raise AttributeError(name)
+        try: return self[name]
+        except KeyError: raise AttributeError(name)
+
+class WPASupplicant(RuleAbider):
+    active = False
+    running = False
+    _cur_config = None
+
+    driver = 'nl80211'
+
+    config = None
+    section = None
+    ssid = None
+    psk = None
+    key_mgmt = None
+
+    CTRL_PATH = '/run/networksecretary/wpa_supplicant'
+    HEADER = '''
+    ctrl_interface=%s
+    update_config=0
+    '''  % CTRL_PATH
+
+    SECTION_TMPL= HEADER + '''
+    network={
+        ssid="%(ssid)s"
+        %(section)s
+    }
+    '''
+
+    def __init__(self, iface):
+        super().__init__()
+        self.iface = weakref.ref(iface)
+        self.active = False
+        self.running = False
+
+    @property
+    def _config(self):
+        return RUNDIR / ('wpa_supplicant.conf.%s' % self.iface().name)
+
+    def _generate_config(self):
+        if self.config:
+            return self.HEADER + self.config
+        elif self.ssid and self.section:
+            return self.SECTION_TMPL % vars(self)
+        elif self.ssid:
+            sec = ''
+            data = {'key_mgmt': self.key_mgmt}
+            if self.psk and len(self.psk) < 64:
+                # TODO escape
+                data['psk'] = '"%s"' % self.psk
+            else:
+                data['psk'] = self.psk
+            for k,v in data.items():
+                if not v: continue
+                sec += '%s=%s\n'%(k,v)
+            return self.SECTION_TMPL%dict(ssid=self.ssid, section=sec)
+
+    def _write_config(self, cfg=None):
+        if cfg is None:
+            cfg = self._generate_config()
+        with rewrite_file(self._config) as file:
+            file.write(cfg)
+        self._cur_config = cfg
+
+    @asyncio.coroutine
+    def _reload(self):
+        cmd = ['wpa_cli', '-p', self.CTRL_PATH, 'reconfigure']
+        proc = yield from asyncio.create_subprocess_exec(*cmd, stdout=sys.stderr)
+        ret = yield from proc.wait()
+        if ret != 0:
+            logger.error('%r failed with exit code %d', cmd, ret)
+
+    def _check_reload(self):
+        cfg = self._generate_config()
+        if cfg != self._cur_config:
+            self._write_config(cfg)
+            run_task(self._reload())
+
+    @asyncio.coroutine
+    def _output_processor(self):
+        data = {}
+        while True:
+            line = yield from self.proc.stdout.readline()
+            if not line: break
+            line = line.decode('utf-8').strip()
+            if False:
+                pass # TODO
+            else:
+                logger.error('Unknown line from wpa_supplicant ignored: %r', line)
+
+    @asyncio.coroutine
+    def start(self):
+        if self.running: return
+        self.running = True
+        iface = self.iface()
+        if iface is None: return
+        self._write_config()
+        cmd = ['wpa_supplicant', '-D'+self.driver, '-i'+iface.name, '-c'+str(self._config)]
+        self.proc = yield from asyncio.create_subprocess_exec(*cmd, stdout=PIPE)
+        self.task = run_task(self._output_processor())
+
+    @asyncio.coroutine
+    def stop(self):
+        if not self.running: return
+        if self.start_task: yield from self.start_task
+        self.proc.terminate()
+        self.task.cancel()
+        self.running = False
+
+    def _check_reload(self):
+        pass
+
+    def commit(self):
+        if self.active:
+            if self.running:
+                self._check_reload()
+            else:
+                self.start_task = run_task(self.start())
+        else:
+            run_task(self.stop())
+    _rbk_commit = commit
+
+    def __del__(self):
+        if self.active: self.proc.kill()
+
+
 
 class WirelessInterface(Interface):
     wireless = True
     scan = False
-    BSS_RE = re.compile(r'^BSS ([0-9a-f]{2}(?::[0-9a-f]{2}){5}).*', re.I)
-    SSID_RE = re.compile(r'^\s*SSID:\s*(.*)$', re.I)
+    connect_to = None
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.ess = EssList()
+        self.wpa_supplicant = WPASupplicant(self)
+
     @asyncio.coroutine
     def do_scan(self):
         # XXX The `iw` help explicitly asks us NOT to screen scrape its output.
         # Too bad there is no other simple way.
-        proc = yield from asyncio.create_subprocess_exec('iw', 'dev', self.name, 'scan',
+        proc = yield from asyncio.create_subprocess_exec(str(LIBDIR / 'wl-scan.sh'), self.name,
                 stdin=DEVNULL, stdout=PIPE)
         out = (yield from proc.communicate())[0].decode('utf-8')
         if proc.returncode != 0:
@@ -188,6 +386,8 @@ class WirelessInterface(Interface):
             # TODO investigate this
             logger.error('Scan failed on %s.', self.name)
             return
+        data = json.loads(out)
+        self.ess._process_scan_results(data)
 
     @asyncio.coroutine
     def scan_coro(self):
@@ -202,6 +402,11 @@ class WirelessInterface(Interface):
             self._scan_task = run_task(self.scan_coro())
         else:
             self._scan_task.cancel()
+
+    def commit(self):
+        if self.connect_to:
+            pass
+        super().commit()
 
 
 class InterfaceMonitor(IpRoute2Table):
@@ -243,6 +448,14 @@ class InterfaceMonitor(IpRoute2Table):
 
 
 class InterfaceList(RuleAbider):
+    """A smart container for Interface objects. Supported operations:
+      * iface_list[iface_index], iface_index in iface_list
+      * iface_list[iface_name], iface_name in iface_list
+      * iface_list[iface_mac], iface_mac in iface_list
+      * iface_list.<iface-name>
+      * for iface in iface_list: ...
+    along with correct change notifications.
+    """
     def __init__(self):
         super().__init__()
         self._data = {}
@@ -302,6 +515,9 @@ class InterfaceList(RuleAbider):
 
     def __iter__(self):
         return iter(self._data.values())
+
+    def __contains__(self, key):
+        return (key in self._data) or (key in self._byname) or (key in self._bymac)
 
     def __getitem__(self, key):
         try: return self._byname[key]
@@ -419,5 +635,3 @@ class DHCPClient(RuleAbider):
 
     def __del__(self):
         if self.active: self.proc.kill()
-
-

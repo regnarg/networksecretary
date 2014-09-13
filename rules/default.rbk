@@ -1,6 +1,7 @@
 set prio -1000
-ignore_ifaces = ['ppp0', 'wlan0']
+ignore_ifaces = ['ppp0'] #, 'wlan0']
 ns.gateway_iface = None prio -2000
+ns.inet_iface = None prio -2000
 
 enter:
     # These functions are declared here (rather than in a *.py file) so that they
@@ -41,19 +42,22 @@ for iface in ns.ifaces:
         iface.addrs = [] prio -2000
         iface.routes = [] prio -2000
         iface.up = False prio -2000
-        iface.role = 'inet_client' prio -2000
+        iface.role = 'inet-client' prio -2000
         iface.netdet_method = 'dhcp' prio -2000
         iface.netid = None prio -2000
         iface.dhcp_client = False prio -2000 # get address from DHCP
         iface.gateway_prio = 0 prio -2000
         iface.gateway = None prio -2000
+        iface.preference = 0 prio -2000
         iface.dhcp_client_obj.active = False prio -2000
         # `ready` is set when the interface is capable of ehternet traffic
         # For wired interfaces this means up&&has carrier, for wireless
         # ones, a successful association.
         iface.ready = False prio -2000
+        if iface.role == 'inet-client':
+            iface.up = ((not ns.inet_iface) or ns.inet_iface == iface
+                            or ns.inet_iface.preference < iface.preference)
         if iface.wireless:
-            iface.up = True # TODO
             iface.scan = False prio -2000
             iface.scan_interval = 60
             iface.preference = -1000
@@ -61,17 +65,17 @@ for iface in ns.ifaces:
                 iface.scan = True
         else:
             iface.preference = 0
-            iface.up = True
-            if iface.carrier:
-                iface.ready = True
-                if iface.netdet_method == 'dhcp' and not iface.netid:
-                    c_enter:
-                        N.logger.debug("### NETDET starting")
-                        from networksecretary.util import LIBDIR
-                        netdet_exec(N.iface, [str(LIBDIR / 'netdet-dhcp.sh'), N.iface.name],
-                                -1000, 'netdet_dhcp')
-                leave:
-                    netdet_cancel(N.iface)
+            iface.up = True prio -2000
+        if iface.carrier:
+            iface.ready = True
+            if iface.netdet_method == 'dhcp' and not iface.netid:
+                c_enter:
+                    N.logger.debug("### NETDET starting")
+                    from networksecretary.util import LIBDIR
+                    netdet_exec(N.iface, [str(LIBDIR / 'netdet-dhcp.sh'), N.iface.name],
+                            -1000, 'netdet_dhcp')
+            leave:
+                netdet_cancel(N.iface)
         if iface.ready and iface.netid:
             iface.dhcp_client = True
         if iface.ready and iface.dhcp_client:
@@ -104,9 +108,15 @@ for iface in ns.ifaces:
                     c_enter:
                         N.iface.netdata.last_ip = N.iface.dhcp_client_obj.lease.ip
                         N.iface.netdata.last_client_id = N.iface.dhcp_client_obj.client_id
-                if iface.role == 'inet_client' and iface.dhcp_client_obj.lease.router:
+                if iface.role == 'inet-client' and iface.dhcp_client_obj.lease.router:
                     iface.gateway = iface.dhcp_client_obj.lease.router
         if iface.ready and iface.gateway:
+            # TODO This should check actual internet availability (e.g. ping 8.8.8.8).
+            # Currently it only checks we have a default gateway.
+            if iface.role == 'inet-client':
+                ns.inet_iface = iface prio iface.preference
+            if ns.inet_iface == iface:
+                iface.gateway_prio = 1000
             ns.gateway_iface = iface prio iface.gateway_prio
             if ns.gateway_iface == iface:
                 ns.gateway = iface.gateway
