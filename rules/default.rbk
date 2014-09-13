@@ -1,7 +1,11 @@
 set prio -1000
-ignore_ifaces = ['ppp0'] #, 'wlan0']
+ignore_ifaces = {'ppp0'} #, 'wlan0'}
 ns.gateway_iface = None prio -2000
 ns.inet_iface = None prio -2000
+# XXX This should be frozenset (we don't want to modify it in-place as that
+#     won't generate any notifications), however, those have no literal syntax.
+ns.addrs = set() prio -2000
+ns.routes = set() prio -2000
 
 enter:
     # These functions are declared here (rather than in a *.py file) so that they
@@ -38,9 +42,10 @@ enter:
         return netdet_coro(iface, cmd_coro, prio, val_id)
 
 for iface in ns.ifaces:
-    if iface.name not in ignore_ifaces:
-        iface.addrs = [] prio -2000
-        iface.routes = [] prio -2000
+    iface.ignore = iface.name in ignore_ifaces
+    if not iface.ignore:
+        iface.addrs = set() prio -2000
+        iface.routes = set() prio -2000
         iface.up = False prio -2000
         iface.role = 'inet-client' prio -2000
         iface.netdet_method = 'dhcp' prio -2000
@@ -112,11 +117,15 @@ for iface in ns.ifaces:
                 iface.dhcp_client_obj.client_id = iface.netdata.last_client_id
             iface.dhcp_client_obj.active = True
             if iface.dhcp_client_obj.lease:
-                iface.addrs = [iface.dhcp_client_obj.lease.addr]
+                iface.addrs = {iface.dhcp_client_obj.lease.addr}
                 if iface.netid:
                     c_enter:
+                        N.logger.info("GOT_LEASE %s %s %s", N.iface.name,
+                                N.iface.dhcp_client_obj.lease.ip,
+                                N.iface.dhcp_client_obj.client_id)
                         N.iface.netdata.last_ip = N.iface.dhcp_client_obj.lease.ip
                         N.iface.netdata.last_client_id = N.iface.dhcp_client_obj.client_id
+                        N.iface.netdata.save()
                 if iface.role == 'inet-client' and iface.dhcp_client_obj.lease.router:
                     iface.gateway = iface.dhcp_client_obj.lease.router
         if iface.ready and iface.gateway:
@@ -129,7 +138,13 @@ for iface in ns.ifaces:
             ns.gateway_iface = iface prio iface.gateway_prio
             if ns.gateway_iface == iface:
                 ns.gateway = iface.gateway
-                iface.routes = ['default via %s'%iface.gateway] # XXX +=
+                iface.routes |= {'default via %s'%iface.gateway}
+        # XXX The `_` prefix is necessary. Otherwise `addr` would end up in the global namespace
+        # and several interfaces will fight for its value.
+        # TODO Fix this better, at least for comprehensions. Also, allow explicit declaration
+        # of block-local variables.
+        if iface.addrs: ns.addrs |= { '%s dev %s' % (_addr, iface.name) for _addr in iface.addrs }
+        if iface.routes: ns.routes |= { '%s dev %s' % (_route, iface.name) for _route in iface.routes }
 
 
 

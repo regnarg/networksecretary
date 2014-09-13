@@ -74,10 +74,21 @@ class IpRoute2Table:
 
 
 class PersistentStorage(RuleAbider):
+    #_instances = weakref.WeakValueDictionary()
+    _instances = {}
+
+    def __new__(cls, key):
+        if key in cls._instances:
+            return cls._instances[key]
+        else:
+            ret = cls._instances[key] = object.__new__(cls)
+            RuleAbider.__init__(ret)
+            ret._key = key
+            ret._load()
+            return ret
+
     def __init__(self, key):
-        super().__init__()
-        self._key = key
-        self._load()
+        pass
 
     @classmethod
     def _get_filename(cls, key):
@@ -110,6 +121,10 @@ class PersistentStorage(RuleAbider):
             raise AttributeError(name)
         return None
 
+def _ip(*a):
+    subprocess.check_call(('ip',)+a, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+
+
 class Interface(RuleAbider):
     up = False
     carrier = False
@@ -117,6 +132,7 @@ class Interface(RuleAbider):
     netid = None
     netdata = None
     gateway = None
+    ignore = False
     addrs = ()
     preference = 0
     def __init__(self, index, name, mac):
@@ -138,28 +154,12 @@ class Interface(RuleAbider):
             self.netdata = None
         self.netid = netid
 
-    def _ip(self, *a):
-        subprocess.check_call(('ip',)+a, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-
     def commit(self):
-        logger.info('IFACE_IPD %s addrs=%r routes=%r', self.name, self.addrs, self.routes)
+        logger.info('IFACE_UPD %s addrs=%r routes=%r', self.name, self.addrs, self.routes)
         if self.up:
-            self._ip('link', 'set', self.name, 'up')
-            # TODO On every update, we flush all addresses and re-add the current list.
-            #      This is ugly. We need some kind of "synchronization": add new addresses,
-            #      remove no-longer-wanted ones and leave the rest alone. This will require
-            #      more sophisticated iproute2 parsing.
-            self._ip('addr', 'flush', 'dev', self.name) # flushes routes too
-            for addr in self.addrs:
-                addr_flds = addr.strip().split()
-                if 'brd' not in addr_flds:
-                    # Auto-set broadcast address if not explicitly given
-                    addr_flds += ['brd', '+']
-                self._ip('addr', 'add', 'dev', self.name, *addr_flds)
-            for route in self.routes:
-                self._ip('route', 'add', 'dev', self.name, *route.strip().split())
+            _ip('link', 'set', self.name, 'up')
         else:
-            self._ip('link', 'set', self.name, 'down')
+            _ip('link', 'set', self.name, 'down')
     _rbk_commit = commit
 
 
@@ -279,6 +279,7 @@ class WPASupplicant(RuleAbider):
         self.iface = weakref.ref(iface)
         self.active = False
         self.running = False
+        self._proc_lock = asyncio.Lock()
 
     @property
     def _config(self):
@@ -338,21 +339,25 @@ class WPASupplicant(RuleAbider):
     @asyncio.coroutine
     def start(self):
         if self.running: return
-        self.running = True
-        iface = self.iface()
-        if iface is None: return
-        self._write_config()
-        cmd = ['wpa_supplicant', '-D'+self.driver, '-i'+iface.name, '-c'+str(self._config)]
-        self.proc = yield from asyncio.create_subprocess_exec(*cmd, stdout=PIPE)
-        self.task = run_task(self._output_processor())
+        with (yield from self._proc_lock):
+            self.running = True
+            iface = self.iface()
+            if iface is None: return
+            self._write_config()
+            cmd = ['wpa_supplicant', '-D'+self.driver, '-i'+iface.name, '-c'+str(self._config)]
+            logger.debug("@@@ WPA_START %r", cmd)
+            self.proc = yield from asyncio.create_subprocess_exec(*cmd, stdout=PIPE)
+            logger.debug("@@@ WPA_START DONE")
+            self.task = run_task(self._output_processor())
 
     @asyncio.coroutine
     def stop(self):
         if not self.running: return
-        if self.start_task: yield from self.start_task
-        self.proc.terminate()
-        self.task.cancel()
-        self.running = False
+        with (yield from self._proc_lock):
+            logger.debug("@@@ WPA_STOP")
+            self.proc.terminate()
+            self.task.cancel()
+            self.running = False
 
     def _check_reload(self):
         pass
@@ -362,7 +367,7 @@ class WPASupplicant(RuleAbider):
             if self.running:
                 self._check_reload()
             else:
-                self.start_task = run_task(self.start())
+                self._start_task = run_task(self.start())
         else:
             run_task(self.stop())
     _rbk_commit = commit
@@ -546,14 +551,36 @@ class InterfaceList(RuleAbider):
 
 
 class NetworkState(RuleAbider):
+    _rbk_commit_order = 1000 # Need to commit AFTER interfaces (so that they are already up)
     def __init__(self):
         super().__init__()
         self.ifaces = InterfaceList()
         self._ifmon = InterfaceMonitor(self.ifaces)
+        self.addrs = set()
+        self.routes = set()
 
     @asyncio.coroutine
     def start(self):
         yield from self._ifmon.start()
+
+    def commit(self):
+        # TODO On every update, we flush all addresses and re-add the current list.
+        #      This is ugly. We need some kind of "synchronization": add new addresses,
+        #      remove no-longer-wanted ones and leave the rest alone. This will require
+        #      more sophisticated iproute2 parsing.
+        for iface in self.ifaces:
+            if not iface.ignore:
+                _ip('addr', 'flush', 'dev', iface.name) # flushes routes too
+        for addr in self.addrs:
+            addr_flds = addr.strip().split()
+            if 'brd' not in addr_flds:
+                # Auto-set broadcast address if not explicitly given
+                addr_flds += ['brd', '+']
+            _ip('addr', 'add', *addr_flds)
+        for route in self.routes:
+            _ip('route', 'add', *route.strip().split())
+
+    _rbk_commit = commit
 
 class DHCPLease(RuleAbider):
     pass
@@ -621,6 +648,7 @@ class DHCPClient(RuleAbider):
         self.running = True
         iface = self.iface()
         if iface is None: return
+        logger.debug("START_DHCP %s %s", self.client_id, self.request_ip)
         cmd = [str(LIBDIR / 'udhcpc-wrapper.sh'), '-i', iface.name, '-f']
         if self.client_id:
             cmd += ['-c', self.client_id]
@@ -628,6 +656,7 @@ class DHCPClient(RuleAbider):
             cmd += ['-r', self.request_ip]
         self.proc = yield from asyncio.create_subprocess_exec(*cmd, stdout=PIPE)
         self.task = run_task(self._output_processor())
+        self.lease = None
 
     @asyncio.coroutine
     def stop(self):
@@ -638,6 +667,7 @@ class DHCPClient(RuleAbider):
         self.proc.kill()
         self.task.cancel()
         self.running = False
+        self.lease = None
 
     def commit(self):
         if self.active: self.start_task = run_task(self.start())
