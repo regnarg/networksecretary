@@ -119,11 +119,6 @@ class Daemon:
         tasks = []
         logger.info("Loading network state")
         self.ns = NetworkState()
-        if HAVE_IPYTHON:
-            self.ipython.ns['ns'] = self.ns
-            self.ipython.start()
-            logger.info("IPython ready. Connect with: ``nsctl console`` or ``ipython console --existing %s``",
-                    self.ipython.app.connection_file)
         self.ctx = rulebook.runtime.Context()
         self.ctx.ns.ns = self.ns # Make the NetworkState available under the name 'ns'
                                  # in the namespace of the rulebooks (a bit unfortunate
@@ -138,6 +133,13 @@ class Daemon:
         try: os.unlink(ctl_path)
         except FileNotFoundError: pass
         yield from asyncio.start_unix_server(self._unix_conn, ctl_path)
+
+        if HAVE_IPYTHON:
+            self.ipython.ns['ns'] = self.ns
+            self.ipython.ns['ctx'] = self.ctx
+            self.ipython.start()
+            logger.info("IPython ready. Connect with: ``nsctl console`` or ``ipython console --existing %s``",
+                    self.ipython.app.connection_file)
 
     def _unix_conn(self, reader, writer):
         logger.info('New unix connection')

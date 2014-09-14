@@ -177,19 +177,8 @@ class Ess(RuleAbider):
         self.data = PersistentStorage('ess.' + essid)
         self.bssids = set()
 
-    # Doesn't play nice with Rulebook. The original idea was that the attribute (e.g.
-    # ess.preference) could be set either with a Rulebook rule or saved to `.data`
-    # and automagically read from there. However, that doesn't work. In fact, read/write
-    # properties don't work at all in Rulebook. Once the property is set by Rulebook,
-    # the attribute is assigned and remains so even when there is no longer any active
-    # Rulebook assignment. This would only work if Rulebook deleted the attribute
-    # when value set is empty. But that probably would be the wrong thing in many
-    # circumstances.
-    ## def __getattr__(self, name):
-    ##     if  not name.startswith('_'):
-    ##         v = getattr(self.data, name)
-    ##         if v: return v
-    ##     raise AttributeError(name)
+    def __repr__(self):
+        return '<Ess %r at 0x%x>'%(self.essid, id(self))
 
 class EssList(RuleAbider):
     """A smart container for Ess objects. Supported operations:
@@ -247,6 +236,9 @@ class EssList(RuleAbider):
         if name.startswith('_'): raise AttributeError(name)
         try: return self[name]
         except KeyError: raise AttributeError(name)
+
+    def __repr__(self):
+        return '<EssList %r>' % list(self._data.keys())
 
 class WPASupplicant(RuleAbider):
     active = False
@@ -374,6 +366,10 @@ class WPASupplicant(RuleAbider):
 
     def __del__(self):
         if self.active: self.proc.kill()
+
+    def __repr__(self):
+        iface = self.iface()
+        return '<WPASupplicant for %s, active=%d>'%(iface.name if iface else '?', self.active)
 
 
 
@@ -548,6 +544,9 @@ class InterfaceList(RuleAbider):
         try: return self[name]
         except KeyError: raise AttributeError(name)
 
+    def __repr__(self):
+        return '<InterfaceList [%s]>' % ', '.join(self._byname)
+
 
 
 class NetworkState(RuleAbider):
@@ -586,13 +585,14 @@ class DHCPLease(RuleAbider):
     pass
 
 class DHCPClient(RuleAbider):
+    client_id = None
+    request_ip = None
+    active = False
+    running = False
+    lease = None
     def __init__(self, iface):
         super().__init__()
         self.iface = weakref.ref(iface, self._iface_removed)
-        self.active = False
-        self.running = False
-        self.client_id = None
-        self.lease = None
 
     def _iface_removed(self):
         self.set_active(False)
@@ -676,3 +676,9 @@ class DHCPClient(RuleAbider):
 
     def __del__(self):
         if self.active: self.proc.kill()
+
+    def __repr__(self):
+        iface = self.iface()
+        return '<DHCPClient for %s, active=%d, cid=%s, req=%s, lease=%r>'%(iface.name if iface else '?',
+                self.active, self.client_id, self.request_ip, self.lease)
+
