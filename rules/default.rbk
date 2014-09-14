@@ -6,6 +6,7 @@ ns.inet_iface = None prio -2000
 #     won't generate any notifications), however, those have no literal syntax.
 ns.addrs = set() prio -2000
 ns.routes = set() prio -2000
+ns.dns_servers = set() prio -2000
 
 enter:
     # These functions are declared here (rather than in a *.py file) so that they
@@ -53,6 +54,7 @@ for iface in ns.ifaces:
         iface.dhcp_client = False prio -2000 # get address from DHCP
         iface.gateway_prio = 0 prio -2000
         iface.gateway = None prio -2000
+        iface.dns_servers = set() prio -2000
         iface.preference = 0 prio -2000
         iface.dhcp_client_obj.active = False prio -2000
         # `ready` is set when the interface is capable of ehternet traffic
@@ -117,7 +119,8 @@ for iface in ns.ifaces:
                 iface.dhcp_client_obj.client_id = iface.netdata.last_client_id
             iface.dhcp_client_obj.active = True
             if iface.dhcp_client_obj.lease:
-                iface.addrs = {iface.dhcp_client_obj.lease.addr}
+                iface.addrs |= {iface.dhcp_client_obj.lease.addr}
+                iface.dns_servers |= iface.dhcp_client_obj.lease.dns
                 if iface.netid:
                     c_enter:
                         N.logger.info("GOT_LEASE %s %s %s", N.iface.name,
@@ -135,6 +138,7 @@ for iface in ns.ifaces:
                 ns.inet_iface = iface prio iface.preference
             if ns.inet_iface == iface:
                 iface.gateway_prio = 1000
+                ns.dns_servers |= iface.dns_servers
             ns.gateway_iface = iface prio iface.gateway_prio
             if ns.gateway_iface == iface:
                 ns.gateway = iface.gateway

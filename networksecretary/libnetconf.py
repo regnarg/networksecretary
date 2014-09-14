@@ -578,6 +578,10 @@ class NetworkState(RuleAbider):
             _ip('addr', 'add', *addr_flds)
         for route in self.routes:
             _ip('route', 'add', *route.strip().split())
+        if self.dns_servers is not None:
+            with rewrite_file('/etc/resolv.conf') as file:
+                for ip in self.dns_servers:
+                    file.write('nameserver %s\n' % ip)
 
     _rbk_commit = commit
 
@@ -608,6 +612,8 @@ class DHCPClient(RuleAbider):
             # Rulebook will ignore assignments that don't change the value.
             # Currently it doesn't so we need this condition so as not to re-set
             # the interface addresses upon every renewal.
+            if k in {'dns'}:
+                v = set(v.split())
             if getattr(lease, k, None) != v:
                 setattr(lease, k, v)
 
