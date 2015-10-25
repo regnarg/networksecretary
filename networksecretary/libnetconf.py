@@ -146,6 +146,10 @@ class Interface(RuleAbider):
         self.up = False
 
         self.dhcp_client_obj = DHCPClient(self)
+        try:
+            self.driver = Path('/sys/class/net/%s/device/driver' % self.name).resolve()
+        except FileNotFoundError:
+            self.driver = None
 
     def set_netid(self, netid):
         if netid:
@@ -351,8 +355,10 @@ class WPASupplicant(RuleAbider):
             self.task.cancel()
             self.running = False
 
-    def _check_reload(self):
-        pass
+    @asyncio.coroutine
+    def restart(self):
+        yield from self.stop()
+        yield from self.start()
 
     def commit(self):
         if self.active:
@@ -586,7 +592,10 @@ class NetworkState(RuleAbider):
     _rbk_commit = commit
 
 class DHCPLease(RuleAbider):
-    pass
+    addr = None
+    ip = None
+    dns = set()
+    router = None
 
 class DHCPClient(RuleAbider):
     client_id = None

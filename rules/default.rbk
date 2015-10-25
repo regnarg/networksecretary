@@ -64,6 +64,8 @@ for iface in ns.ifaces:
         if iface.role == 'inet-client':
             iface.up = ((not ns.inet_iface) or ns.inet_iface == iface
                             or ns.inet_iface.preference < iface.preference)
+        else:
+            iface.up = True
         if iface.wireless:
             iface.scan = False prio -2000
             iface.scan_interval = 60
@@ -82,14 +84,20 @@ for iface in ns.ifaces:
                     ess.known = False prio -2000
                     ess.preference = 0 prio -2000
                     ess.wpa_section = None prio -2000
+                    ess.psk = None prio -2000
+                    ess.key_mgmt = None prio -2000
                     if ess.data.known: ess.known = ess.data.known
                     if ess.data.preference: ess.preference = ess.data.preference
                     if ess.data.wpa_section: ess.wpa_section = ess.data.wpa_section
+                    if ess.data.psk: ess.psk = ess.data.psk
+                    if ess.data.key_mgmt: ess.key_mgmt = ess.data.key_mgmt
                     if ess.known:
                         iface.connect_to = ess prio ess.preference
                         if iface.connect_to == ess:
                             iface.wpa_supplicant.ssid = ess.essid
                             iface.wpa_supplicant.section = ess.wpa_section
+                            iface.wpa_supplicant.psk = ess.psk
+                            iface.wpa_supplicant.key_mgmt = ess.key_mgmt
                             iface.wpa_supplicant.active = True
         else:
             iface.preference = 0
